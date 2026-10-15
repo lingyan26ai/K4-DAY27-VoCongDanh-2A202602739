@@ -29,6 +29,23 @@ from common.schemas import (
 
 console = Console()
 
+# Same calibrated rubric as exercise 1 so PR #1 lands in the 58–72% band.
+SYSTEM_PROMPT = """You are a senior software engineer reviewing a GitHub pull request.
+Return a structured review: summary, risk_factors, comments (tied to file/line),
+confidence in [0, 1], and confidence_reasoning.
+
+Compute confidence with this rubric (show the arithmetic in confidence_reasoning):
+- Start at 0.80.
+- SECURITY red flag: subtract 0.15 EACH. Security red flags are ONLY: weak/broken
+  password hashing or crypto (MD5, SHA1, no salt), secrets/tokens stored or sent in
+  plaintext, SQL/command injection (strings built with f-strings or concatenation),
+  missing or bypassable auth, hard-coded credentials or user ids, insecure transport (http).
+- MINOR open question: subtract 0.05 EACH, at most 3 of them (max -0.15). Examples:
+  schema change without a migration, missing input validation, missing tests,
+  unclear default value, naming/UX nits.
+- Clamp the result to [0.10, 0.95].
+"""
+
 
 def node_fetch_pr(state: ReviewState) -> dict:
     console.print("[cyan]→ fetch_pr[/cyan]")
@@ -43,8 +60,8 @@ def node_analyze(state: ReviewState) -> dict:
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff'][:40_000]}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
     return {"analysis": analysis}
@@ -62,18 +79,21 @@ def node_route(state: ReviewState) -> dict:
 
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
+    console.print("[cyan]→ human_approval[/cyan]  [dim]pausing for reviewer[/dim]")
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    # No side effects before interrupt(): this node re-runs from the top on resume.
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "pr_title": state.get("pr_title", ""),
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback") or None}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -100,7 +120,8 @@ def _post(state: ReviewState, label: str) -> str:
 
 def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
-    if state.get("human_choice") == "approve":
+    if state.get("human_choice") in ("approve", "edit"):
+        # "edit" posts the review with the reviewer's note appended (see _render_comment_body).
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
@@ -133,8 +154,8 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    # interrupt() needs a checkpointer to save state while paused.
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +195,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)  # same cfg → same thread_id
 
     console.rule("Done")
     console.print(result.get("final_action"))
